@@ -1,6 +1,7 @@
 /**
  * 💎 Official JJH TipBot — Modern UI Edition
  * Same logic, fully restyled outputs: branded embeds, avatars & link buttons.
+ * + 🌧️ Tip Rain: plain `!tip` (or `!tip <usd>`) rains on 10 random members.
  */
 require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
@@ -109,6 +110,14 @@ db.serialize(() => {
   )`);
 
   db.run(`INSERT OR IGNORE INTO settings (key, value) VALUES ('faucet_enabled', 'true')`);
+
+  // Chat activity tracking — powers the Tip Rain pool (active chatters only)
+  db.run(`CREATE TABLE IF NOT EXISTS activity (
+    discord_id TEXT,
+    guild_id TEXT,
+    last_seen INTEGER,
+    PRIMARY KEY (discord_id, guild_id)
+  )`);
 
   db.run(`ALTER TABLE transactions ADD COLUMN amount_sol REAL`, (err) => {
     if (err && err.message.includes('duplicate column name')) {} else if (err) {
@@ -317,6 +326,23 @@ async function checkOwner(message) {
     return false;
   }
   return true;
+}
+
+// ═══════════════════════════════════════════════════════════
+// 🟢 ACTIVITY TRACKER — remembers who is chatting, per server.
+//    Writes at most once per minute per user to keep the DB light.
+// ═══════════════════════════════════════════════════════════
+const lastActivityWrite = new Map();
+async function trackActivity(message) {
+  if (!message.guild || message.author.bot) return;
+  const key = `${message.guild.id}:${message.author.id}`;
+  const now = Date.now();
+  if (now - (lastActivityWrite.get(key) || 0) < 60000) return;
+  lastActivityWrite.set(key, now);
+  try {
+    await dbRun(`INSERT OR REPLACE INTO activity (discord_id, guild_id, last_seen) VALUES (?, ?, ?)`,
+      [message.author.id, message.guild.id, now]);
+  } catch { /* activity is best-effort */ }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -579,7 +605,7 @@ async function handleMessageHelp(message) {
   if (canTip) {
     embed.addFields({
       name: '💸 Tipping',
-      value: '`!tip @user <usd>` — tip in USD, auto-converted to SOL\n`!tip @user` — quick-tip $0.10',
+      value: '`!tip @user <usd>` — tip in USD, auto-converted to SOL\n`!tip @user` — quick-tip $0.10\n`!tip` — 🌧️ **Tip Rain!** $1 split across 10 random **active** members (chatted in the last 30 min)\n`!tip <usd>` — 🌧️ Tip Rain with your own total (e.g. `!tip 5`)',
       inline: false
     });
   }
@@ -870,6 +896,152 @@ async function handleMessageRemovePending(message) {
 }
 
 // ═══════════════════════════════════════════════════════════
+// 🌧️ TIP RAIN — `!tip` with no mention rains on random members
+//    `!tip`        → $1 total, split across up to 10 random members
+//    `!tip 5`      → $5 total, split across up to 10 random members
+//    Pool: ACTIVE chatters only — linked wallet + chatted in this server
+//    in the last 30 minutes (sender excluded). If the pool has fewer
+//    than 10 members, everyone in the pool gets a share.
+// ═══════════════════════════════════════════════════════════
+const RAIN_MAX_RECIPIENTS = 10;
+const RAIN_DEFAULT_TOTAL_USD = 1;
+const RAIN_ACTIVE_WINDOW_MIN = 30; // only members who chatted in the last 30 minutes
+
+async function handleMessageTipRain(message, totalUSD) {
+  const senderId = message.author.id;
+
+  if (!await hasTipPermission(senderId)) {
+    await replyError(message, 'You don\'t have tipping permission yet.\nAsk the owner: `!gp @user`', 12000);
+    return;
+  }
+
+  if (!botKeypair) {
+    await replyError(message, 'Bot wallet isn\'t configured. Contact an admin.');
+    return;
+  }
+
+  if (isNaN(totalUSD) || totalUSD <= 0) {
+    await replyError(message, 'Enter a valid rain amount.\nExample: `!tip` for a $1 rain, or `!tip 5` for a $5 rain.', 8000);
+    return;
+  }
+
+  if (!message.guild) {
+    await replyError(message, '🌧️ Tip Rain only works inside a server channel — that\'s where the active chatters are!', 8000);
+    return;
+  }
+
+  try {
+    const sender = await dbGet(`SELECT * FROM users WHERE discord_id = ?`, [senderId]);
+    if (!sender?.wallet) {
+      await replyError(message, 'Link your wallet first: `!wallet <address>`');
+      return;
+    }
+
+    // Pool = ACTIVE chatters only: valid linked wallet + sent a message in
+    // THIS server within the last RAIN_ACTIVE_WINDOW_MIN minutes. Sender excluded.
+    const activeSince = Date.now() - (RAIN_ACTIVE_WINDOW_MIN * 60 * 1000);
+    const poolRows = await dbAll(
+      `SELECT u.discord_id, u.username, u.wallet FROM users u
+       JOIN activity a ON a.discord_id = u.discord_id
+       WHERE u.wallet IS NOT NULL AND u.wallet != '' AND u.discord_id != ?
+         AND a.guild_id = ? AND a.last_seen >= ?`,
+      [senderId, message.guild.id, activeSince]
+    );
+    const pool = poolRows.filter((u) => {
+      try {
+        return new PublicKey(u.wallet).toString() !== '11111111111111111111111111111111';
+      } catch { return false; }
+    });
+
+    if (pool.length === 0) {
+      await replyError(message, `No active members to rain on right now.\nRain only hits members who **chatted in this server in the last ${RAIN_ACTIVE_WINDOW_MIN} minutes** AND have a wallet linked with \`!wallet <address>\`.`);
+      return;
+    }
+
+    // Shuffle (Fisher–Yates) and take up to RAIN_MAX_RECIPIENTS.
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    const recipients = pool.slice(0, RAIN_MAX_RECIPIENTS);
+
+    // Equal split, rounded DOWN to 3 decimals so the total never exceeds the ask.
+    const perUSD = Math.floor((totalUSD / recipients.length) * 1000) / 1000;
+    if (perUSD < 0.001) {
+      await replyError(message, `That total is too small to split ${recipients.length} ways.\nMinimum per person is **$0.001** — try a bigger rain!`, 10000);
+      return;
+    }
+
+    const solPrice = await getSolPrice();
+    const perSOL = perUSD / solPrice;
+
+    if (perSOL < 0.000005) {
+      await replyError(message,
+        `Each share is too small for the Solana network.\n` +
+        `${fmtUSD(perUSD)} = ${perSOL.toFixed(8)} SOL\n` +
+        `Minimum on-chain: **0.000005 SOL** (≈ ${fmtUSD(0.000005 * solPrice)}) per person.`, 12000);
+      return;
+    }
+
+    const totalSOL = perSOL * recipients.length;
+    const botBalance = await getBalance(botKeypair.publicKey.toString());
+    const requiredBalance = totalSOL + (0.00001 * recipients.length);
+
+    if (botBalance < requiredBalance) {
+      await replyError(message,
+        `**Bot vault is empty!**\nPlease ask <@637927094319579140> or <@235836165716967424> to refill it.\n${shortAddr(botKeypair.publicKey.toString())}`, 15000);
+      return;
+    }
+
+    const statusMsg = await message.reply({
+      embeds: [infoEmbed('🌧️ Tip Rain Incoming!',
+        `**${message.author.username}** is raining **${fmtUSD(perUSD)}** on **${recipients.length}** random **active** members…`)]
+    });
+
+    const results = [];
+    for (const r of recipients) {
+      const res = await sendSOL(r.wallet, perSOL);
+      if (res.success) {
+        await dbRun(`INSERT INTO transactions (sender_id, receiver_id, amount_usd, amount_sol, signature) VALUES (?, ?, ?, ?, ?)`,
+          [senderId, r.discord_id, perUSD, perSOL, res.signature]);
+        await dbRun(`UPDATE users SET balance_usd = balance_usd + ?, total_received = total_received + ? WHERE discord_id = ?`,
+          [perUSD, perUSD, r.discord_id]);
+        results.push({ user: r, ok: true, sig: res.signature });
+      } else {
+        results.push({ user: r, ok: false });
+      }
+    }
+
+    const okResults = results.filter((x) => x.ok);
+    if (okResults.length > 0) {
+      await dbRun(`UPDATE users SET total_tipped = total_tipped + ? WHERE discord_id = ?`,
+        [perUSD * okResults.length, senderId]);
+    }
+
+    const lines = results.map((x) => x.ok
+      ? `• <@${x.user.discord_id}> — **${fmtUSD(perUSD)}** [🔍](${SOLSCAN_TX(x.sig)})`
+      : `• <@${x.user.discord_id}> — ⚠️ failed`);
+
+    const embed = goldEmbed('🌧️ Tip Rain!',
+        `**${message.author.username}** made it rain on **${okResults.length}** members!`)
+      .setThumbnail(avatarOf(message.author))
+      .addFields(
+        { name: '💸 Per person', value: `**${fmtUSD(perUSD)}** ≈ ${perSOL.toFixed(6)} SOL`, inline: true },
+        { name: '🌧️ Total rained', value: `**${fmtUSD(perUSD * okResults.length)}**`, inline: true },
+        { name: '🎲 Winners', value: lines.join('\n').slice(0, 3500), inline: false }
+      );
+    if (okResults.length < results.length) {
+      embed.addFields({ name: '⚠️ Note', value: `${results.length - okResults.length} transfer(s) failed and were not charged.`, inline: false });
+    }
+
+    await statusMsg.edit({ embeds: [embed] });
+  } catch (error) {
+    console.error('Tip rain error:', error);
+    await replyError(message, `Tip rain failed:\n${error.message}`, 12000);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 // 💸 !tip HANDLER — modern outputs
 // ═══════════════════════════════════════════════════════════
 async function handleMessageTip(message) {
@@ -883,7 +1055,13 @@ async function handleMessageTip(message) {
 
   const receiver = message.mentions.users.first();
   if (!receiver) {
-    await replyError(message, 'Mention someone to tip!\nExample: `!tip @John 1` or `!tip @John`');
+    // 🌧️ No mention → TIP RAIN. `!tip` = default $1 rain, `!tip 5` = $5 rain.
+    if (parts.length >= 2 && isNaN(parseFloat(parts[1]))) {
+      await replyError(message, 'Mention someone to tip, or rain on the server!\nExamples: `!tip @John 1` • `!tip` (rain $1) • `!tip 5` (rain $5)');
+      return true;
+    }
+    const totalUSD = parts.length >= 2 ? parseFloat(parts[1]) : RAIN_DEFAULT_TOTAL_USD;
+    await handleMessageTipRain(message, totalUSD);
     return true;
   }
 
@@ -1025,6 +1203,8 @@ async function handleMessageTip(message) {
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
+  trackActivity(message); // 🟢 feed the Tip Rain active-chatters pool
+
   const content = message.content.trim();
 
   if (content.toLowerCase().startsWith('!tip')) {
@@ -1078,6 +1258,7 @@ client.once('ready', async () => {
   }
   console.log('🎨 Modern UI loaded — branded embeds, avatars & Solscan buttons');
   console.log('📝 Commands: !wallet, !bal, !faucet, !history, !help, !tip, !botbal');
+  console.log('🌧️ Tip Rain: !tip (=$1) or !tip <usd> — splits across 10 random members');
   console.log('🔧 Admin: !gp, !rp, !lp, !last, !fon, !foff, !vp, !rpt');
 
   await client.user.setPresence({
