@@ -605,7 +605,7 @@ async function handleMessageHelp(message) {
   if (canTip) {
     embed.addFields({
       name: '💸 Tipping',
-      value: '`!tip @user <usd>` — tip in USD, auto-converted to SOL\n`!tip @user` — quick-tip $0.10\n`!tip` — 🌧️ **Tip Rain!** $1 split across 10 random **active** members (chatted in the last 30 min)\n`!tip <usd>` — 🌧️ Tip Rain with your own total (e.g. `!tip 5`)',
+      value: '`!tip @user <usd>` — tip in USD, auto-converted to SOL\n`!tip @user` — quick-tip $0.10\n`!tip` — 🌧️ **Tip Rain!** 10 random **active** members (chatted in the last 30 min) get $0.10 each — no wallet? Tip goes pending, auto-pays on link\n`!tip <count>` — 🌧️ Custom Tip Rain: that many people x $0.10 each (e.g. `!tip 3` = 3 people)',
       inline: false
     });
   }
@@ -896,18 +896,21 @@ async function handleMessageRemovePending(message) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// 🌧️ TIP RAIN — `!tip` with no mention rains on random members
-//    `!tip`        → $1 total, split across up to 10 random members
-//    `!tip 5`      → $5 total, split across up to 10 random members
-//    Pool: ACTIVE chatters only — linked wallet + chatted in this server
-//    in the last 30 minutes (sender excluded). If the pool has fewer
-//    than 10 members, everyone in the pool gets a share.
+// 🌧️ TIP RAIN — `!tip` with no mention rains on random ACTIVE members
+//    `!tip`        → 10 random active members x $0.10 each (= $1)
+//    `!tip 1`      → 1 random active member x $0.10
+//    `!tip 3`      → 3 random active members x $0.10 each — the number
+//                    is the PEOPLE count, per-person amount is the base $0.10
+//    Pool: ACTIVE chatters only — chatted in this server in the last
+//    30 minutes (sender excluded), wallet or not. Walletless winners
+//    get a pending tip that auto-pays when they link a wallet. If the
+//    pool has fewer than 10 members, everyone in the pool gets a share.
 // ═══════════════════════════════════════════════════════════
-const RAIN_MAX_RECIPIENTS = 10;
-const RAIN_DEFAULT_TOTAL_USD = 1;
-const RAIN_ACTIVE_WINDOW_MIN = 30; // only members who chatted in the last 30 minutes
+const RAIN_DEFAULT_RECIPIENTS = 10;  // plain `!tip` rains on 10 people
+const RAIN_PER_PERSON_USD = 0.1;     // base amount every winner gets
+const RAIN_ACTIVE_WINDOW_MIN = 30;   // only members who chatted in the last 30 minutes
 
-async function handleMessageTipRain(message, totalUSD) {
+async function handleMessageTipRain(message, recipientCount) {
   const senderId = message.author.id;
 
   if (!await hasTipPermission(senderId)) {
@@ -920,8 +923,8 @@ async function handleMessageTipRain(message, totalUSD) {
     return;
   }
 
-  if (isNaN(totalUSD) || totalUSD <= 0) {
-    await replyError(message, 'Enter a valid rain amount.\nExample: `!tip` for a $1 rain, or `!tip 5` for a $5 rain.', 8000);
+  if (!Number.isInteger(recipientCount) || recipientCount <= 0) {
+    await replyError(message, 'Tell me how many people.\nExample: `!tip` rains on 10 people, `!tip 3` rains on 3 people — everyone gets $0.10.', 8000);
     return;
   }
 
@@ -937,40 +940,33 @@ async function handleMessageTipRain(message, totalUSD) {
       return;
     }
 
-    // Pool = ACTIVE chatters only: valid linked wallet + sent a message in
-    // THIS server within the last RAIN_ACTIVE_WINDOW_MIN minutes. Sender excluded.
+    // Pool = ACTIVE chatters in THIS server within the last
+    // RAIN_ACTIVE_WINDOW_MIN minutes — wallet or NO wallet.
+    // No wallet (or an invalid one saved) → the tip goes to the pending
+    // queue and pays out automatically when they link a wallet, exactly
+    // like a normal pending tip. Sender excluded.
     const activeSince = Date.now() - (RAIN_ACTIVE_WINDOW_MIN * 60 * 1000);
     const poolRows = await dbAll(
-      `SELECT u.discord_id, u.username, u.wallet FROM users u
-       JOIN activity a ON a.discord_id = u.discord_id
-       WHERE u.wallet IS NOT NULL AND u.wallet != '' AND u.discord_id != ?
-         AND a.guild_id = ? AND a.last_seen >= ?`,
-      [senderId, message.guild.id, activeSince]
+      `SELECT discord_id FROM activity WHERE guild_id = ? AND last_seen >= ? AND discord_id != ?`,
+      [message.guild.id, activeSince, senderId]
     );
-    const pool = poolRows.filter((u) => {
-      try {
-        return new PublicKey(u.wallet).toString() !== '11111111111111111111111111111111';
-      } catch { return false; }
-    });
+    const pool = poolRows.map((r) => r.discord_id);
 
     if (pool.length === 0) {
-      await replyError(message, `No active members to rain on right now.\nRain only hits members who **chatted in this server in the last ${RAIN_ACTIVE_WINDOW_MIN} minutes** AND have a wallet linked with \`!wallet <address>\`.`);
+      await replyError(message, `No active members to rain on right now.\nRain only hits members who **chatted in this server in the last ${RAIN_ACTIVE_WINDOW_MIN} minutes**.`);
       return;
     }
 
-    // Shuffle (Fisher–Yates) and take up to RAIN_MAX_RECIPIENTS.
+    // Shuffle (Fisher–Yates) and take the requested number of people.
+    // Pool smaller than the count? Everyone in the pool gets it.
     for (let i = pool.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [pool[i], pool[j]] = [pool[j], pool[i]];
     }
-    const recipients = pool.slice(0, RAIN_MAX_RECIPIENTS);
+    const recipients = pool.slice(0, recipientCount);
 
-    // Equal split, rounded DOWN to 3 decimals so the total never exceeds the ask.
-    const perUSD = Math.floor((totalUSD / recipients.length) * 1000) / 1000;
-    if (perUSD < 0.001) {
-      await replyError(message, `That total is too small to split ${recipients.length} ways.\nMinimum per person is **$0.001** — try a bigger rain!`, 10000);
-      return;
-    }
+    // Every winner gets the fixed base amount.
+    const perUSD = RAIN_PER_PERSON_USD;
 
     const solPrice = await getSolPrice();
     const perSOL = perUSD / solPrice;
@@ -999,39 +995,65 @@ async function handleMessageTipRain(message, totalUSD) {
     });
 
     const results = [];
-    for (const r of recipients) {
-      const res = await sendSOL(r.wallet, perSOL);
+    for (const rid of recipients) {
+      // Wallet linked? Send now. No wallet? Queue it as a pending tip —
+      // it auto-processes the moment they run `!wallet <address>`.
+      const u = await dbGet(`SELECT wallet FROM users WHERE discord_id = ?`, [rid]);
+      let wallet = null;
+      if (u?.wallet) {
+        try {
+          const pk = new PublicKey(u.wallet);
+          if (pk.toString() !== '11111111111111111111111111111111') wallet = u.wallet;
+        } catch { wallet = null; }
+      }
+
+      if (!wallet) {
+        await dbRun(`INSERT INTO pending_tips (sender_id, receiver_id, amount_usd) VALUES (?, ?, ?)`,
+          [senderId, rid, perUSD]);
+        results.push({ id: rid, status: 'pending' });
+        continue;
+      }
+
+      const res = await sendSOL(wallet, perSOL);
       if (res.success) {
         await dbRun(`INSERT INTO transactions (sender_id, receiver_id, amount_usd, amount_sol, signature) VALUES (?, ?, ?, ?, ?)`,
-          [senderId, r.discord_id, perUSD, perSOL, res.signature]);
+          [senderId, rid, perUSD, perSOL, res.signature]);
         await dbRun(`UPDATE users SET balance_usd = balance_usd + ?, total_received = total_received + ? WHERE discord_id = ?`,
-          [perUSD, perUSD, r.discord_id]);
-        results.push({ user: r, ok: true, sig: res.signature });
+          [perUSD, perUSD, rid]);
+        results.push({ id: rid, status: 'sent', sig: res.signature });
       } else {
-        results.push({ user: r, ok: false });
+        results.push({ id: rid, status: 'failed' });
       }
     }
 
-    const okResults = results.filter((x) => x.ok);
-    if (okResults.length > 0) {
+    const sentResults = results.filter((x) => x.status === 'sent');
+    const pendingResults = results.filter((x) => x.status === 'pending');
+    const failedResults = results.filter((x) => x.status === 'failed');
+    if (sentResults.length > 0) {
       await dbRun(`UPDATE users SET total_tipped = total_tipped + ? WHERE discord_id = ?`,
-        [perUSD * okResults.length, senderId]);
+        [perUSD * sentResults.length, senderId]);
     }
 
-    const lines = results.map((x) => x.ok
-      ? `• <@${x.user.discord_id}> — **${fmtUSD(perUSD)}** [🔍](${SOLSCAN_TX(x.sig)})`
-      : `• <@${x.user.discord_id}> — ⚠️ failed`);
+    const lines = results.map((x) => {
+      if (x.status === 'sent') return `• <@${x.id}> — **${fmtUSD(perUSD)}** [🔍](${SOLSCAN_TX(x.sig)})`;
+      if (x.status === 'pending') return `• <@${x.id}> — **${fmtUSD(perUSD)}** ⏳ pending (auto-pays when they link a wallet)`;
+      return `• <@${x.id}> — ⚠️ failed`;
+    });
 
+    const delivered = sentResults.length + pendingResults.length;
     const embed = goldEmbed('🌧️ Tip Rain!',
-        `**${message.author.username}** made it rain on **${okResults.length}** members!`)
+        `**${message.author.username}** made it rain on **${delivered}** active members!`)
       .setThumbnail(avatarOf(message.author))
       .addFields(
         { name: '💸 Per person', value: `**${fmtUSD(perUSD)}** ≈ ${perSOL.toFixed(6)} SOL`, inline: true },
-        { name: '🌧️ Total rained', value: `**${fmtUSD(perUSD * okResults.length)}**`, inline: true },
+        { name: '🌧️ Total rained', value: `**${fmtUSD(perUSD * delivered)}**`, inline: true },
         { name: '🎲 Winners', value: lines.join('\n').slice(0, 3500), inline: false }
       );
-    if (okResults.length < results.length) {
-      embed.addFields({ name: '⚠️ Note', value: `${results.length - okResults.length} transfer(s) failed and were not charged.`, inline: false });
+    if (pendingResults.length > 0) {
+      embed.addFields({ name: '⏳ Pending', value: `${pendingResults.length} winner(s) have no wallet linked — their tip is queued and auto-sends as soon as they run \`!wallet <address>\` to link one.`, inline: false });
+    }
+    if (failedResults.length > 0) {
+      embed.addFields({ name: '⚠️ Note', value: `${failedResults.length} transfer(s) failed and were not charged.`, inline: false });
     }
 
     await statusMsg.edit({ embeds: [embed] });
@@ -1055,13 +1077,13 @@ async function handleMessageTip(message) {
 
   const receiver = message.mentions.users.first();
   if (!receiver) {
-    // 🌧️ No mention → TIP RAIN. `!tip` = default $1 rain, `!tip 5` = $5 rain.
-    if (parts.length >= 2 && isNaN(parseFloat(parts[1]))) {
-      await replyError(message, 'Mention someone to tip, or rain on the server!\nExamples: `!tip @John 1` • `!tip` (rain $1) • `!tip 5` (rain $5)');
+    // 🌧️ No mention → TIP RAIN. `!tip` = 10 people, `!tip 3` = 3 people (x $0.10 each).
+    if (parts.length >= 2 && (!Number.isInteger(Number(parts[1])) || Number(parts[1]) <= 0)) {
+      await replyError(message, 'Mention someone to tip, or rain on the server!\nExamples: `!tip @John 1` • `!tip` (rain on 10 people) • `!tip 3` (rain on 3 people)');
       return true;
     }
-    const totalUSD = parts.length >= 2 ? parseFloat(parts[1]) : RAIN_DEFAULT_TOTAL_USD;
-    await handleMessageTipRain(message, totalUSD);
+    const recipientCount = parts.length >= 2 ? Number(parts[1]) : RAIN_DEFAULT_RECIPIENTS;
+    await handleMessageTipRain(message, recipientCount);
     return true;
   }
 
@@ -1258,7 +1280,7 @@ client.once('ready', async () => {
   }
   console.log('🎨 Modern UI loaded — branded embeds, avatars & Solscan buttons');
   console.log('📝 Commands: !wallet, !bal, !faucet, !history, !help, !tip, !botbal');
-  console.log('🌧️ Tip Rain: !tip (=$1) or !tip <usd> — splits across 10 random members');
+  console.log('🌧️ Tip Rain: !tip (=10 people) or !tip <count> — $0.10 each to random active members');
   console.log('🔧 Admin: !gp, !rp, !lp, !last, !fon, !foff, !vp, !rpt');
 
   await client.user.setPresence({
