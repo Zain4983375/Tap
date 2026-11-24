@@ -57,6 +57,22 @@ async function replyError(message, text, delDelay = 10000) {
   autoDeleteErrorMessage(message, delDelay);
   return reply;
 }
+/**
+ * Dismiss-style delivery for sensitive lists (pending tips): the list
+ * posts in the SAME channel the command was used in, then deletes
+ * itself (and the command message) after `delDelay` ms — like a
+ * dismissable message. No DM. Returns 'reply' | null.
+ */
+async function sendPrivate(message, payload, delDelay = 30000) {
+  try {
+    const reply = await message.reply(payload);
+    autoDeleteErrorMessage(reply, delDelay);
+    autoDeleteErrorMessage(message, delDelay);
+    return 'reply';
+  } catch {
+    return null;
+  }
+}
 const shortAddr = (a) => (a ? `\`${a.slice(0, 4)}…${a.slice(-4)}\`` : '`—`');
 const fmtUSD = (n) => `$${Number(n).toFixed(2)}`;
 const fmtSOL = (n, d = 4) => `${Number(n).toFixed(d)} SOL`;
@@ -838,7 +854,7 @@ async function handleMessageHelp(message) {
       },
       {
         name: '📜 Activity',
-        value: '`!history` — your last 10 transactions\n`!help` — this menu',
+        value: '`!history` — your last 10 transactions\n`!vpt` — your pending tips (auto-deletes)\n`!help` — this menu',
         inline: false
       }
     );
@@ -854,7 +870,7 @@ async function handleMessageHelp(message) {
   if (isOwnerUser) {
     embed.addFields({
       name: '🔧 Admin',
-      value: '`!gp @user` / `!rp @user` — give / remove tip permission\n`!lp` — list tippers\n`!last` — last 10 bot transactions\n`!fon` / `!foff` — faucet on / off\n`!vp @user` / `!rpt @user` — view / clear pending tips',
+      value: '`!gp @user` / `!rp @user` — give / remove tip permission\n`!lp` — list tippers\n`!last` — last 10 bot transactions\n`!fon` / `!foff` — faucet on / off\n`!vp` — ALL pending tips (auto-deletes)\n`!vp @user` — one user\'s pending tips (auto-deletes)\n`!rpt @user` — clear pending tips + refund',
       inline: false
     });
     embed.addFields({
@@ -1070,41 +1086,130 @@ async function handleMessageFaucetOff(message) {
 }
 
 // 13. !vp — view pending tips
+// 13. !vp — owner-only pending-tips overview, dismiss-style.
+//     `!vp` (no mention) → ALL pending tips, grouped by receiver.
+//     `!vp @user`        → that one user's pending tips in detail.
+//     Both post in the same channel and auto-delete after 30s.
 async function handleMessageViewPending(message) {
   if (!await checkOwner(message)) return;
 
   const targetUser = message.mentions.users.first();
-  if (!targetUser) {
-    await replyError(message, 'Mention a user first.\nUsage: `!vp @user`', 8000);
-    return;
-  }
 
   try {
+    // ── No mention: full overview, grouped by receiver ──
+    if (!targetUser) {
+      const rows = await dbAll(
+        `SELECT receiver_id, COUNT(*) AS cnt, SUM(amount_usd) AS total, MIN(created_at) AS oldest
+         FROM pending_tips WHERE processed = 0 GROUP BY receiver_id ORDER BY total DESC`
+      );
+
+      if (rows.length === 0) {
+        await sendPrivate(message, { embeds: [infoEmbed('⏳ Pending Tips', 'No pending tips right now — everything is paid out! ✅')] });
+        return;
+      }
+
+      let grandTotal = 0;
+      let grandCount = 0;
+      const lines = [];
+      const shown = rows.slice(0, 25);
+      for (const r of shown) {
+        grandTotal += r.total;
+        grandCount += r.cnt;
+        const since = r.oldest ? r.oldest.slice(0, 10) : '—';
+        lines.push(`• <@${r.receiver_id}> — **${r.cnt}** tip${r.cnt > 1 ? 's' : ''} • **${fmtUSD(r.total)}** • since ${since}`);
+      }
+      // Totals must cover rows beyond the 25 shown too.
+      for (const r of rows.slice(25)) {
+        grandTotal += r.total;
+        grandCount += r.cnt;
+      }
+      if (rows.length > 25) {
+        lines.push(`…and **${rows.length - 25}** more receiver${rows.length - 25 > 1 ? 's' : ''}`);
+      }
+
+      const embed = goldEmbed(`⏳ All Pending Tips (${rows.length} receiver${rows.length > 1 ? 's' : ''})`, lines.join('\n').slice(0, 3900))
+        .addFields({ name: 'Total waiting', value: `**${grandCount}** tips • **${fmtUSD(grandTotal)}**`, inline: false });
+      await sendPrivate(message, { embeds: [embed] });
+      return;
+    }
+
+    // ── Mention: one user's pending tips in detail ──
     const pendingTips = await dbAll(
-      `SELECT * FROM pending_tips WHERE receiver_id = ? AND processed = 0`,
+      `SELECT * FROM pending_tips WHERE receiver_id = ? AND processed = 0 ORDER BY created_at ASC`,
       [targetUser.id]
     );
 
     if (pendingTips.length === 0) {
-      await replyError(message, `No pending tips waiting for **${targetUser.username}**.`);
+      await sendPrivate(message, { embeds: [infoEmbed('⏳ Pending Tips', `No pending tips waiting for **${targetUser.username}**.`)] });
       return;
     }
 
     let total = 0;
     const lines = [];
     for (const tip of pendingTips) {
-      const sender = await dbGet(`SELECT username FROM users WHERE discord_id = ?`, [tip.sender_id]);
+      let senderName;
+      if (tip.sender_id === 'giveaway') senderName = '🎉 Giveaway';
+      else if (tip.sender_id === 'faucet') senderName = '🚰 Faucet';
+      else {
+        const sender = await dbGet(`SELECT username FROM users WHERE discord_id = ?`, [tip.sender_id]);
+        senderName = sender?.username || 'Unknown';
+      }
       total += tip.amount_usd;
-      lines.push(`• **${fmtUSD(tip.amount_usd)}** from ${sender?.username || 'Unknown'}`);
+      const when = tip.created_at ? tip.created_at.slice(0, 10) : '—';
+      lines.push(`• **${fmtUSD(tip.amount_usd)}** from ${senderName} • ${when}`);
     }
 
     const embed = goldEmbed(`⏳ Pending Tips — ${targetUser.username}`, lines.join('\n').slice(0, 3500))
       .setThumbnail(avatarOf(targetUser))
       .addFields({ name: 'Total waiting', value: `**${pendingTips.length}** tips • **${fmtUSD(total)}**`, inline: false });
 
-    await message.reply({ embeds: [embed] });
+    await sendPrivate(message, { embeds: [embed] });
   } catch (error) {
     await replyError(message, `Couldn't load pending tips: ${error.message}`, 8000);
+  }
+}
+
+// 13b. !vpt — anyone can view their OWN pending tips.
+//      Same delivery as !vp: posts in-channel, auto-deletes after 30s.
+async function handleMessageViewMyPending(message) {
+  const userId = message.author.id;
+
+  try {
+    const pendingTips = await dbAll(
+      `SELECT * FROM pending_tips WHERE receiver_id = ? AND processed = 0 ORDER BY created_at ASC`,
+      [userId]
+    );
+
+    if (pendingTips.length === 0) {
+      await sendPrivate(message, { embeds: [infoEmbed('⏳ Your Pending Tips', 'You have no pending tips waiting.')] });
+      return;
+    }
+
+    let total = 0;
+    const lines = [];
+    for (const tip of pendingTips) {
+      let senderName;
+      if (tip.sender_id === 'giveaway') senderName = '🎉 Giveaway';
+      else if (tip.sender_id === 'faucet') senderName = '🚰 Faucet';
+      else {
+        const sender = await dbGet(`SELECT username FROM users WHERE discord_id = ?`, [tip.sender_id]);
+        senderName = sender?.username || 'Unknown';
+      }
+      total += tip.amount_usd;
+      const when = tip.created_at ? tip.created_at.slice(0, 10) : '—';
+      lines.push(`• **${fmtUSD(tip.amount_usd)}** from ${senderName} • ${when}`);
+    }
+
+    const embed = goldEmbed('⏳ Your Pending Tips', lines.join('\n').slice(0, 3500))
+      .setThumbnail(avatarOf(message.author))
+      .addFields(
+        { name: 'Total waiting', value: `**${pendingTips.length}** tips • **${fmtUSD(total)}**`, inline: false },
+        { name: 'How to claim', value: 'Run `!wallet <address>` — everything pending auto-sends to your wallet on link! ⚡', inline: false }
+      );
+
+    await sendPrivate(message, { embeds: [embed] });
+  } catch (error) {
+    await replyError(message, `Couldn't load your pending tips: ${error.message}`, 8000);
   }
 }
 
@@ -1902,6 +2007,7 @@ client.on('messageCreate', async (message) => {
         case '!fon':     await handleMessageFaucetOn(message); break;
         case '!foff':    await handleMessageFaucetOff(message); break;
         case '!vp':      await handleMessageViewPending(message); break;
+        case '!vpt':     await handleMessageViewMyPending(message); break;
         case '!rpt':     await handleMessageRemovePending(message); break;
         case '!gstart':  await handleMessageGiveawayStart(message); break;
         case '!gend':    await handleMessageGiveawayEnd(message); break;
@@ -1932,7 +2038,7 @@ client.once('ready', async () => {
     console.log(`Owner ID: ${OWNER_ID}`);
   }
   console.log('🎨 Modern UI loaded — branded embeds, avatars & Solscan buttons');
-  console.log('📝 Commands: !wallet, !bal, !faucet, !history, !help, !tip, !botbal');
+  console.log('📝 Commands: !wallet, !bal, !faucet, !history, !vpt, !help, !tip, !botbal');
   console.log('💸 Tips: USDC (SPL) — $1 = 1 USDC');
   console.log('🌧️ Tip Rain: !tip (=10 people) or !tip <count> — $0.10 USDC each to random active members (max 50)');
   console.log('🎉 Giveaway: !gstart <word> <usd> <minutes> • !gend • !gcancel • !gstatus');
